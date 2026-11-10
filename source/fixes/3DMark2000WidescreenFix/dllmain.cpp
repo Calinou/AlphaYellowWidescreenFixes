@@ -44,12 +44,23 @@ public:
 
 	void ParseFixConfig(inipp::Ini<char>& ini) override
 	{
+		inipp::get_value(ini.sections["Settings"], "Width", m_newResX);
+		inipp::get_value(ini.sections["Settings"], "Height", m_newResY);
 		inipp::get_value(ini.sections["Settings"], "FOVFactor", m_fovFactor);
+
+		FallbackToDesktopResolution(m_newResX, m_newResY);
+
+		spdlog_confparse(m_newResX);
+		spdlog_confparse(m_newResY);
 		spdlog_confparse(m_fovFactor);
 	}
 
 	void ApplyFix() override
 	{
+		m_newAspectRatio = static_cast<float>(m_newResX) / static_cast<float>(m_newResY);
+		m_aspectRatioScale = m_newAspectRatio / m_oldAspectRatio;
+		spdlog::info("Render resolution: {}x{} (aspect ratio = {}, scale = {})", m_newResX, m_newResY, m_newAspectRatio, m_aspectRatioScale);
+
 		// The MAX-FX engine (P_Camera) lives in e2mfc.dll, which 3DMark2000.exe imports statically.
 		HMODULE engineModule = GetModuleHandleA("e2mfc.dll");
 		if (!engineModule)
@@ -59,12 +70,37 @@ public:
 		}
 
 		auto* engineBase = reinterpret_cast<std::uint8_t*>(engineModule);
-		auto* validateFunc = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?validate@P_Camera@@QAEXXZ"));
-		auto* prepareFunc = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?prepare@P_Camera@@QAEXXZ"));
 
-		if (!validateFunc || !prepareFunc)
+		// Override the resolution chosen in 3DMark's own settings: P_Driver::setFullscreenMode/setWindowMode receive
+		// (this, HWND, width, height, ...), so width/height live at [esp+8]/[esp+0Ch] on entry.
+		auto* fullscreenFunc = GetProcAddress(engineModule, "?setFullscreenMode@P_Driver@@QAEXPAUHWND__@@IIIW4Buffering@1@IPAVP_ZBufferFormat@@_N@Z");
+		auto* windowFunc = GetProcAddress(engineModule, "?setWindowMode@P_Driver@@QAEXPAUHWND__@@IIPAVP_ZBufferFormat@@_N@Z");
+
+		if (!fullscreenFunc || !windowFunc)
 		{
-			spdlog::error("Failed to locate P_Camera::validate / P_Camera::prepare exports.");
+			spdlog::error("Failed to locate P_Driver::setFullscreenMode/setWindowMode exports.");
+			return;
+		}
+
+		auto resolutionCallback = [](SafetyHookContext& ctx)
+		{
+			if (auto* self = s_instance_)
+			{
+				auto* width = reinterpret_cast<std::uint32_t*>(ctx.esp + 0x8);
+				auto* height = reinterpret_cast<std::uint32_t*>(ctx.esp + 0xC);
+				spdlog::info("Overriding display mode {}x{} -> {}x{}", *width, *height, self->m_newResX, self->m_newResY);
+				*width = static_cast<std::uint32_t>(self->m_newResX);
+				*height = static_cast<std::uint32_t>(self->m_newResY);
+			}
+		};
+
+		m_fullscreenModeHook = safetyhook::create_mid(fullscreenFunc, resolutionCallback);
+		m_windowModeHook = safetyhook::create_mid(windowFunc, resolutionCallback);
+		auto* validateFunc = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?validate@P_Camera@@QAEXXZ"));
+
+		if (!validateFunc)
+		{
+			spdlog::error("Failed to locate P_Camera::validate export.");
 			return;
 		}
 
@@ -80,61 +116,86 @@ public:
 		m_fovScaleConstant = *reinterpret_cast<float**>(validateFunc + 0x1B);
 		spdlog::info("P_Camera::validate: Address is e2mfc.dll+{:x}, FOV scale constant = {}", validateFunc - engineBase, *m_fovScaleConstant);
 
-		// P_Camera::prepare: push ebp; mov ebp,esp; sub esp,20h; push ebx; push esi; push edi; mov esi,ecx; call validate; <hook>
-		std::uint8_t* prepareHookAddress = prepareFunc + 0x10;
-		if (prepareFunc[0x0B] != 0xE8 || prepareHookAddress + *reinterpret_cast<std::int32_t*>(prepareFunc + 0x0C) != validateFunc)
+		// Hook the final 'ret' of P_Camera::validate (ecx = camera). Every consumer of the tangents (projection matrix in
+		// prepare, frustum/guard band planes via getViewPlaneRay, getViewportCoordinate, ...) calls validate first, so
+		// patching here keeps all of them consistent, even when validate runs outside of prepare (e.g. from setFOV).
+		std::uint8_t* validateRetAddress = validateFunc + 0x53;
+		if (validateRetAddress[0] != 0xC3 || validateRetAddress[1] != 0x90 || validateRetAddress[4] != 0x90)
 		{
-			spdlog::error("Unexpected P_Camera::prepare code layout.");
+			spdlog::error("Unexpected P_Camera::validate epilogue.");
 			return;
 		}
 
-		spdlog::info("P_Camera::prepare hook: Address is e2mfc.dll+{:x}", prepareHookAddress - engineBase);
+		spdlog::info("P_Camera::validate hook: Address is e2mfc.dll+{:x}", validateRetAddress - engineBase);
 
-		m_cameraHook = safetyhook::create_mid(prepareHookAddress, [](SafetyHookContext& ctx)
+		m_cameraHook = safetyhook::create_mid(validateRetAddress, [](SafetyHookContext& ctx)
 		{
 			auto* self = s_instance_;
-			if (self && ctx.esi)
+			if (self && ctx.ecx)
 			{
-				self->AdjustCamera(ctx.esi);
+				self->AdjustCamera(ctx.ecx);
+			}
+		});
+
+		auto* clearRect = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?clearScreen@P_Driver@@QAEXABUtagRECT@@W4ClearingMode@1@ABVG_Color@@@Z"));
+		auto* endScene = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?endScene@P_Driver@@QAEXXZ"));
+
+		if (!clearRect || !endScene)
+		{
+			spdlog::error("Failed to locate P_Driver functions; intro side bars disabled.");
+			return;
+		}
+
+		// When a demo run ends (or is aborted) the engine restores the desktop display mode; restart the bar timer there so
+		// it counts from 0 again when the demo is restarted from the 3DMark2000 interface.
+		if (auto* restoreDisplayMode = GetProcAddress(engineModule, "?restoreDisplayMode@P_Driver@@QAEXXZ"))
+		{
+			m_restoreDisplayModeHook = safetyhook::create_mid(restoreDisplayMode, [](SafetyHookContext&)
+			{
+				if (auto* self = s_instance_)
+				{
+					self->m_firstFrameTick = 0;
+				}
+			});
+		}
+		else
+		{
+			spdlog::error("Failed to locate P_Driver::restoreDisplayMode; bar timer will not reset on demo restart.");
+		}
+		m_clearScreenRect = reinterpret_cast<ClearScreenRectFn>(clearRect);
+		spdlog::info("P_Driver::endScene: Address is e2mfc.dll+{:x}", endScene - engineBase);
+
+		// The intro (loading text, DirectX 7 logo and white flash) is laid out for 4:3, so the widened sides are covered with
+		// black bars for the first seconds after the demo starts rendering.
+		m_endSceneHook = safetyhook::create_mid(endScene, [](SafetyHookContext& ctx)
+		{
+			auto* self = s_instance_;
+			if (!self || !ctx.ecx)
+			{
+				return;
+			}
+
+			const DWORD now = GetTickCount();
+			if (self->m_firstFrameTick == 0)
+			{
+				self->m_firstFrameTick = now;
+			}
+
+			const DWORD elapsed = now - self->m_firstFrameTick;
+			if (elapsed < m_introBarsDurationMs)
+			{
+				self->DrawSideBars(ctx.ecx, 0x00);
+			}
+			else if (elapsed >= m_whiteBarsStartMs && elapsed < m_whiteBarsEndMs)
+			{
+				self->DrawSideBars(ctx.ecx, 0xFF);
 			}
 		});
 	}
 
 private:
-	void UpdateAspectRatio()
-	{
-		int width = 0;
-		int height = 0;
-
-		RECT rect{};
-		HWND window = GetActiveWindow();
-		if (window && GetClientRect(window, &rect))
-		{
-			width = rect.right - rect.left;
-			height = rect.bottom - rect.top;
-		}
-
-		if (width <= 0 || height <= 0)
-		{
-			auto desktopDimensions = Util::GetPhysicalDesktopDimensions();
-			width = desktopDimensions.first;
-			height = desktopDimensions.second;
-		}
-
-		if (width != m_newResX || height != m_newResY)
-		{
-			m_newResX = width;
-			m_newResY = height;
-			m_newAspectRatio = static_cast<float>(width) / static_cast<float>(height);
-			m_aspectRatioScale = m_newAspectRatio / m_oldAspectRatio;
-			spdlog::info("Render resolution: {}x{} (aspect ratio = {}, scale = {})", width, height, m_newAspectRatio, m_aspectRatioScale);
-		}
-	}
-
 	void AdjustCamera(uintptr_t camera)
 	{
-		UpdateAspectRatio();
-
 		const float fov = *reinterpret_cast<float*>(camera + 0x118);
 		const float vpLeft = *reinterpret_cast<float*>(camera + 0x1CC);
 		const float vpRight = *reinterpret_cast<float*>(camera + 0x1D0);
@@ -156,9 +217,45 @@ private:
 		*reinterpret_cast<float*>(camera + 0x20C) = tanY;
 	}
 
+	void DrawSideBars(uintptr_t driver, std::uint8_t shade)
+	{
+		// The driver's own surface dimensions (P_Driver +0x8/+0xC) define the coordinate space used by clearScreen, which
+		// can differ from the physical window size (e.g. with DPI scaling).
+		const int surfaceWidth = *reinterpret_cast<int*>(driver + 0x8);
+		const int surfaceHeight = *reinterpret_cast<int*>(driver + 0xC);
+		if (surfaceWidth <= 0 || surfaceHeight <= 0)
+		{
+			return;
+		}
+
+		const int viewWidth = static_cast<int>(std::lround(surfaceHeight * m_oldAspectRatio));
+		const int barWidth = (surfaceWidth - viewWidth) / 2;
+		if (barWidth <= 0)
+		{
+			return;
+		}
+
+		const std::uint8_t color[4] = { shade, shade, shade, 0xFF };
+		const RECT leftBar{ 0, 0, barWidth, surfaceHeight };
+		const RECT rightBar{ surfaceWidth - barWidth, 0, surfaceWidth, surfaceHeight };
+		m_clearScreenRect(reinterpret_cast<void*>(driver), &leftBar, 2, color);
+		m_clearScreenRect(reinterpret_cast<void*>(driver), &rightBar, 2, color);
+	}
+
+using ClearScreenRectFn = void(__thiscall*)(void* driver, const RECT* rect, int clearingMode, const void* color);
+
 	static constexpr float m_oldAspectRatio = 4.0f / 3.0f;
+	static constexpr DWORD m_introBarsDurationMs = 16750;
+	static constexpr DWORD m_whiteBarsStartMs = 80000;
+	static constexpr DWORD m_whiteBarsEndMs = 87750;
 
 	SafetyHookMid m_cameraHook{};
+	SafetyHookMid m_fullscreenModeHook{};
+	SafetyHookMid m_windowModeHook{};
+	SafetyHookMid m_endSceneHook{};
+	ClearScreenRectFn m_clearScreenRect = nullptr;
+	DWORD m_firstFrameTick = 0;
+	SafetyHookMid m_restoreDisplayModeHook{};
 	float* m_fovScaleConstant = nullptr;
 	float m_fovFactor = 1.0f;
 
