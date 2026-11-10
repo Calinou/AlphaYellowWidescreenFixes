@@ -61,6 +61,23 @@ public:
 		m_aspectRatioScale = m_newAspectRatio / m_oldAspectRatio;
 		spdlog::info("Render resolution: {}x{} (aspect ratio = {}, scale = {})", m_newResX, m_newResY, m_newAspectRatio, m_aspectRatioScale);
 
+		// Aspect ratios wider than the display can't be shown without stretching, so render at the desktop resolution and
+		// letterbox a centered band with the requested aspect ratio instead.
+		const auto desktop = Util::GetPhysicalDesktopDimensions();
+		m_displayResX = m_newResX;
+		m_displayResY = m_newResY;
+		if (desktop.first > 0 && desktop.second > 0)
+		{
+			const float desktopAspectRatio = static_cast<float>(desktop.first) / static_cast<float>(desktop.second);
+			if (m_newAspectRatio > desktopAspectRatio + 0.001f)
+			{
+				m_letterbox = true;
+				m_displayResX = desktop.first;
+				m_displayResY = desktop.second;
+				spdlog::info("Aspect ratio is wider than the display: using {}x{} display mode with letterboxing.", m_displayResX, m_displayResY);
+			}
+		}
+
 		// The MAX-FX engine (P_Camera) lives in e2mfc.dll, which 3DMark2000.exe imports statically.
 		HMODULE engineModule = GetModuleHandleA("e2mfc.dll");
 		if (!engineModule)
@@ -88,9 +105,9 @@ public:
 			{
 				auto* width = reinterpret_cast<std::uint32_t*>(ctx.esp + 0x8);
 				auto* height = reinterpret_cast<std::uint32_t*>(ctx.esp + 0xC);
-				spdlog::info("Overriding display mode {}x{} -> {}x{}", *width, *height, self->m_newResX, self->m_newResY);
-				*width = static_cast<std::uint32_t>(self->m_newResX);
-				*height = static_cast<std::uint32_t>(self->m_newResY);
+				spdlog::info("Overriding display mode {}x{} -> {}x{}", *width, *height, self->m_displayResX, self->m_displayResY);
+				*width = static_cast<std::uint32_t>(self->m_displayResX);
+				*height = static_cast<std::uint32_t>(self->m_displayResY);
 			}
 		};
 
@@ -181,6 +198,11 @@ public:
 				self->m_firstFrameTick = now;
 			}
 
+			if (self->m_letterbox)
+			{
+				self->DrawLetterbox(ctx.ecx);
+			}
+
 			const DWORD elapsed = now - self->m_firstFrameTick;
 			if (elapsed < m_introBarsDurationMs)
 			{
@@ -210,8 +232,13 @@ private:
 
 		// Recomputed from the camera FOV every time so repeated calls stay idempotent.
 		const float baseTanX = std::tan(fov * *m_fovScaleConstant) * m_fovFactor;
-		const float tanY = baseTanX * (vpBottom - vpTop) / vpWidth;
 		const float tanX = baseTanX * m_aspectRatioScale;
+
+		// When letterboxing, keep pixels square on the full display surface; the visible band then shows exactly the
+		// requested aspect ratio.
+		const float tanY = m_letterbox
+			? tanX * static_cast<float>(m_displayResY) / static_cast<float>(m_displayResX)
+			: baseTanX * (vpBottom - vpTop) / vpWidth;
 
 		*reinterpret_cast<float*>(camera + 0x208) = tanX;
 		*reinterpret_cast<float*>(camera + 0x20C) = tanY;
@@ -228,7 +255,11 @@ private:
 			return;
 		}
 
-		const int viewWidth = static_cast<int>(std::lround(surfaceHeight * m_oldAspectRatio));
+		int bandTop = 0;
+		int bandHeight = surfaceHeight;
+		GetVisibleBand(surfaceWidth, surfaceHeight, bandTop, bandHeight);
+
+		const int viewWidth = static_cast<int>(std::lround(bandHeight * m_oldAspectRatio));
 		const int barWidth = (surfaceWidth - viewWidth) / 2;
 		if (barWidth <= 0)
 		{
@@ -236,13 +267,48 @@ private:
 		}
 
 		const std::uint8_t color[4] = { shade, shade, shade, 0xFF };
-		const RECT leftBar{ 0, 0, barWidth, surfaceHeight };
-		const RECT rightBar{ surfaceWidth - barWidth, 0, surfaceWidth, surfaceHeight };
+		const RECT leftBar{ 0, bandTop, barWidth, bandTop + bandHeight };
+		const RECT rightBar{ surfaceWidth - barWidth, bandTop, surfaceWidth, bandTop + bandHeight };
 		m_clearScreenRect(reinterpret_cast<void*>(driver), &leftBar, 2, color);
 		m_clearScreenRect(reinterpret_cast<void*>(driver), &rightBar, 2, color);
 	}
 
-using ClearScreenRectFn = void(__thiscall*)(void* driver, const RECT* rect, int clearingMode, const void* color);
+	void GetVisibleBand(int surfaceWidth, int surfaceHeight, int& bandTop, int& bandHeight) const
+	{
+		bandTop = 0;
+		bandHeight = surfaceHeight;
+		if (m_letterbox)
+		{
+			bandHeight = std::min(surfaceHeight, static_cast<int>(std::lround(surfaceWidth / m_newAspectRatio)));
+			bandTop = (surfaceHeight - bandHeight) / 2;
+		}
+	}
+
+	void DrawLetterbox(uintptr_t driver)
+	{
+		const int surfaceWidth = *reinterpret_cast<int*>(driver + 0x8);
+		const int surfaceHeight = *reinterpret_cast<int*>(driver + 0xC);
+		if (surfaceWidth <= 0 || surfaceHeight <= 0)
+		{
+			return;
+		}
+
+		int bandTop = 0;
+		int bandHeight = surfaceHeight;
+		GetVisibleBand(surfaceWidth, surfaceHeight, bandTop, bandHeight);
+		if (bandTop <= 0)
+		{
+			return;
+		}
+
+		const std::uint8_t black[4] = { 0x00, 0x00, 0x00, 0xFF };
+		const RECT topBar{ 0, 0, surfaceWidth, bandTop };
+		const RECT bottomBar{ 0, bandTop + bandHeight, surfaceWidth, surfaceHeight };
+		m_clearScreenRect(reinterpret_cast<void*>(driver), &topBar, 2, black);
+		m_clearScreenRect(reinterpret_cast<void*>(driver), &bottomBar, 2, black);
+	}
+
+	using ClearScreenRectFn = void(__thiscall*)(void* driver, const RECT* rect, int clearingMode, const void* color);
 
 	static constexpr float m_oldAspectRatio = 4.0f / 3.0f;
 	static constexpr DWORD m_introBarsDurationMs = 16750;
@@ -258,6 +324,9 @@ using ClearScreenRectFn = void(__thiscall*)(void* driver, const RECT* rect, int 
 	SafetyHookMid m_restoreDisplayModeHook{};
 	float* m_fovScaleConstant = nullptr;
 	float m_fovFactor = 1.0f;
+	int m_displayResX = 0;
+	int m_displayResY = 0;
+	bool m_letterbox = false;
 
 	inline static _3DMark2000WidescreenFix* s_instance_ = nullptr;
 };
