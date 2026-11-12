@@ -90,12 +90,12 @@ public:
 
 		// Override the resolution chosen in 3DMark's own settings: P_Driver::setFullscreenMode/setWindowMode receive
 		// (this, HWND, width, height, ...), so width/height live at [esp+8]/[esp+0Ch] on entry.
-		auto* fullscreenFunc = GetProcAddress(engineModule, "?setFullscreenMode@P_Driver@@QAEXPAUHWND__@@IIIW4Buffering@1@IPAVP_ZBufferFormat@@_N@Z");
-		auto* windowFunc = GetProcAddress(engineModule, "?setWindowMode@P_Driver@@QAEXPAUHWND__@@IIPAVP_ZBufferFormat@@_N@Z");
+		auto* fullscreenFunc = Memory::PatternScan(engineModule, "55 8B EC 83 E4 F8 83 EC 2C 53 56 57");
+		auto* windowFunc = Memory::PatternScan(engineModule, "51 53 56 57 6A 00 8B F1 6A 00 8D 4C");
 
 		if (!fullscreenFunc || !windowFunc)
 		{
-			spdlog::error("Failed to locate P_Driver::setFullscreenMode/setWindowMode exports.");
+			spdlog::error("Failed to locate P_Driver::setFullscreenMode/setWindowMode memory addresses.");
 			return;
 		}
 
@@ -113,11 +113,11 @@ public:
 
 		m_fullscreenModeHook = safetyhook::create_mid(fullscreenFunc, resolutionCallback);
 		m_windowModeHook = safetyhook::create_mid(windowFunc, resolutionCallback);
-		auto* validateFunc = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?validate@P_Camera@@QAEXXZ"));
+		auto* validateFunc = Memory::PatternScan(engineModule, "8B 81 B8 00 00 00 8B D0 C1 EA 06 F6");
 
 		if (!validateFunc)
 		{
-			spdlog::error("Failed to locate P_Camera::validate export.");
+			spdlog::error("Failed to locate P_Camera::validate memory address.");
 			return;
 		}
 
@@ -154,8 +154,8 @@ public:
 			}
 		});
 
-		auto* clearRect = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?clearScreen@P_Driver@@QAEXABUtagRECT@@W4ClearingMode@1@ABVG_Color@@@Z"));
-		auto* endScene = reinterpret_cast<std::uint8_t*>(GetProcAddress(engineModule, "?endScene@P_Driver@@QAEXXZ"));
+		auto* clearRect = Memory::PatternScan(engineModule, "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 83 EC 0C 53 56 57 89 65 F0 6A 00 8B F1 6A 00 8D 4D EC FF 15 ?? ?? ?? ?? 8B 4D 0C 8B 55 08 8B 06 51 8B 4D 10 52 51 C7 45");
+		auto* endScene = Memory::PatternScan(engineModule, "6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 51 56 6A 00 8B F1 6A 00 8D 4C 24 0C FF 15 ?? ?? ?? ?? 8B 06 8B CE C7 44 24 10 00 00 00 00 FF 50 10 8D 4C 24 04 C6 46 74 00 C7 44");
 
 		if (!clearRect || !endScene)
 		{
@@ -165,7 +165,7 @@ public:
 
 		// When a demo run ends (or is aborted) the engine restores the desktop display mode; restart the bar timer there so
 		// it counts from 0 again when the demo is restarted from the 3DMark2000 interface.
-		if (auto* restoreDisplayMode = GetProcAddress(engineModule, "?restoreDisplayMode@P_Driver@@QAEXXZ"))
+		if (auto* restoreDisplayMode = Memory::PatternScan(engineModule, "51 56 6A 00 8B F1 6A 00 8D 4C 24 0C FF 15 ?? ?? ?? ?? 83 7E 68 02 7E 07 8B 06 8B CE FF 50 24 8D"))
 		{
 			m_restoreDisplayModeHook = safetyhook::create_mid(restoreDisplayMode, [](SafetyHookContext&)
 			{
