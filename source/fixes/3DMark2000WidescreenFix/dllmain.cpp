@@ -47,12 +47,14 @@ public:
 		inipp::get_value(ini.sections["Settings"], "Width", m_newResX);
 		inipp::get_value(ini.sections["Settings"], "Height", m_newResY);
 		inipp::get_value(ini.sections["Settings"], "FOVFactor", m_fovFactor);
+		inipp::get_value(ini.sections["Settings"], "UseRadialFog", m_useRadialFog);
 
 		FallbackToDesktopResolution(m_newResX, m_newResY);
 
 		spdlog_confparse(m_newResX);
 		spdlog_confparse(m_newResY);
 		spdlog_confparse(m_fovFactor);
+		spdlog_confparse(m_useRadialFog);
 	}
 
 	void ApplyFix() override
@@ -108,6 +110,9 @@ public:
 				spdlog::info("Overriding display mode {}x{} -> {}x{}", *width, *height, self->m_displayResX, self->m_displayResY);
 				*width = static_cast<std::uint32_t>(self->m_displayResX);
 				*height = static_cast<std::uint32_t>(self->m_displayResY);
+
+				// The Direct3D driver DLL is loaded on demand, so it's only available once a display mode is set.
+				self->InstallRadialFogHook();
 			}
 		};
 
@@ -307,6 +312,39 @@ private:
 		m_clearScreenRect(reinterpret_cast<void*>(driver), &rightBar, 2, color);
 	}
 
+	void InstallRadialFogHook()
+	{
+		if (!m_useRadialFog || m_rangeFogHook)
+		{
+			return;
+		}
+
+		HMODULE driverModule = GetModuleHandleA("e2_d3d_driver_mfc.dll");
+		if (!driverModule)
+		{
+			spdlog::error("e2_d3d_driver_mfc.dll is not loaded; radial fog disabled.");
+			return;
+		}
+
+		// Device setup: mov eax,[edi] ; mov ecx,[eax] ; push ebx ; push 30h (D3DRENDERSTATE_RANGEFOGENABLE) ; push eax ;
+		// call [ecx+50h] (IDirect3DDevice7::SetRenderState). The game uses vertex fog with unchanged fog start/end, so
+		// enabling range-based fog turns planar fog into radial fog at the same distance.
+		auto* RangeFogScanResult = Memory::PatternScan(driverModule, "8B 07 8B 08 53 6A 30 50 FF 51 50");
+		if (!RangeFogScanResult)
+		{
+			spdlog::error("Failed to locate range fog render state memory address.");
+			return;
+		}
+
+		spdlog::info("Range Fog Render State: Address is e2_d3d_driver_mfc.dll+{:x}", RangeFogScanResult + 7 - reinterpret_cast<std::uint8_t*>(driverModule));
+
+		// Hook at 'push eax': [esp] = render state, [esp+4] = value.
+		m_rangeFogHook = safetyhook::create_mid(RangeFogScanResult + 7, [](SafetyHookContext& ctx)
+		{
+			*reinterpret_cast<std::uint32_t*>(ctx.esp + 0x4) = TRUE;
+		});
+	}
+
 	void GetVisibleBand(int surfaceWidth, int surfaceHeight, int& bandTop, int& bandHeight) const
 	{
 		bandTop = 0;
@@ -360,6 +398,8 @@ private:
 	SafetyHookMid m_restoreDisplayModeHook{};
 	float* m_fovScaleConstant = nullptr;
 	float m_fovFactor = 1.0f;
+	bool m_useRadialFog = true;
+	SafetyHookMid m_rangeFogHook{};
 	int m_displayResX = 0;
 	int m_displayResY = 0;
 	bool m_letterbox = false;
