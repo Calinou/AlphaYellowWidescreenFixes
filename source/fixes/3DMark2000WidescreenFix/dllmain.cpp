@@ -171,6 +171,13 @@ public:
 			{
 				if (auto* self = s_instance_)
 				{
+					// The display mode is also restored during startup before anything is rendered; only a run that has
+					// rendered frames ends the demo.
+					if (self->m_firstFrameTick != 0)
+					{
+						self->m_demoMode = false;
+					}
+
 					self->m_firstFrameTick = 0;
 				}
 			});
@@ -179,11 +186,33 @@ public:
 		{
 			spdlog::error("Failed to locate P_Driver::restoreDisplayMode; bar timer will not reset on demo restart.");
 		}
+
+		// The demo's initialization routine (which logs "Demo initializing took %2.2f seconds") only runs when the demo is
+		// started, whether from the GUI or with /demo, so it identifies demo mode as opposed to benchmark mode.
+		auto DemoInitScanResult = Memory::PatternScan(ExeModule(), "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 81 EC 4C 01 00 00 53 56 57 8B D9 89 65 F0 89 5D B0 E8");
+		if (DemoInitScanResult)
+		{
+			spdlog::info("Demo Initialization: Address is {:s}+{:x}", ExeName().c_str(), DemoInitScanResult - reinterpret_cast<std::uint8_t*>(ExeModule()));
+
+			m_demoInitHook = safetyhook::create_mid(DemoInitScanResult, [](SafetyHookContext&)
+			{
+				if (auto* self = s_instance_)
+				{
+					spdlog::info("Demo mode started.");
+					self->m_demoMode = true;
+				}
+			});
+		}
+		else
+		{
+			spdlog::error("Failed to locate demo initialization memory address; side bars disabled.");
+		}
+
 		m_clearScreenRect = reinterpret_cast<ClearScreenRectFn>(clearRect);
 		spdlog::info("P_Driver::endScene: Address is e2mfc.dll+{:x}", endScene - engineBase);
 
-		// The intro (loading text, DirectX 7 logo and white flash) is laid out for 4:3, so the widened sides are covered with
-		// black bars for the first seconds after the demo starts rendering.
+		// The demo intro (loading text, DirectX 7 logo and white flash) is laid out for 4:3, so the widened sides are covered
+		// with black bars for the first seconds after the demo starts rendering. Benchmark runs don't get these bars.
 		m_endSceneHook = safetyhook::create_mid(endScene, [](SafetyHookContext& ctx)
 		{
 			auto* self = s_instance_;
@@ -201,6 +230,11 @@ public:
 			if (self->m_letterbox)
 			{
 				self->DrawLetterbox(ctx.ecx);
+			}
+
+			if (!self->m_demoMode)
+			{
+				return;
 			}
 
 			const DWORD elapsed = now - self->m_firstFrameTick;
@@ -321,6 +355,8 @@ private:
 	SafetyHookMid m_endSceneHook{};
 	ClearScreenRectFn m_clearScreenRect = nullptr;
 	DWORD m_firstFrameTick = 0;
+	SafetyHookMid m_demoInitHook{};
+	bool m_demoMode = false;
 	SafetyHookMid m_restoreDisplayModeHook{};
 	float* m_fovScaleConstant = nullptr;
 	float m_fovFactor = 1.0f;
